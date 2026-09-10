@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import argparse         # đọc tham số trực tiếp từ kaggle
+from tqdm import tqdm   # hiện thanh tiến trình
 
 import torch
 import torch.nn as nn
@@ -10,21 +12,41 @@ from torchvision import datasets, transforms, models
 import pandas as pd
 from PIL import Image
 
+# Đảm bảo console Windows in được tiếng Việt UTF-8 không bị lỗi charmap
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# ==============================================================================
+# 0. ĐỌC THAM SỐ DÒNG LỆNH (ARGPARSE)
+# Cho phép truyền tham số linh hoạt từ terminal hoặc Kaggle Notebook:
+# Ví dụ: python train.py --epochs 20 --batch-size 64 --lr 1e-4
+# ==============================================================================
+parser = argparse.ArgumentParser(description="Huấn luyện mô hình Intel Image Classification")
+parser.add_argument("--batch-size", type=int, default=32, help="Số ảnh trên 1 batch (mặc định: 32)")
+parser.add_argument("--epochs", type=int, default=15, help="Số epoch huấn luyện (mặc định: 15)")
+parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (mặc định: 0.0001)")
+args = parser.parse_args()
+
+BATCH_SIZE = args.batch_size          # Trên máy local CPU để 16; khi lên Kaggle/Colab GPU để 32 hoặc 64
+EPOCHS = args.epochs               # Chạy thử 2 epoch trên local; khi train thật để 10-15
+LEARNING_RATE = args.lr     # Chuẩn cho fine-tuning pretrained model
+NUM_CLASSES = 6
+IMAGE_SIZE = (224, 224)
+
 # Tự động nhận diện đang chạy trên Kaggle hay trên máy Local
 KAGGLE_DATA_PATH = "/kaggle/input/datasets/puneet6060/intel-image-classification"
 if os.path.exists(KAGGLE_DATA_PATH):
     print(">> Đang chạy trên môi trường KAGGLE GPU")
     BASE_DATA = KAGGLE_DATA_PATH
     OUTPUT_DIR = "/kaggle/working"   # Thư mục duy nhất được phép ghi/lưu file trên Kaggle
+elif os.path.exists("/kaggle/input/intel-image-classification"):
+    print(">> Đang chạy trên môi trường KAGGLE GPU")
+    BASE_DATA = "/kaggle/input/intel-image-classification"
+    OUTPUT_DIR = "/kaggle/working"
 else:
     print(">> Đang chạy trên môi trường LOCAL")
     BASE_DATA = "intel_data"
     OUTPUT_DIR = "."
-
-
-# Đảm bảo console Windows in được tiếng Việt UTF-8 không bị lỗi charmap
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
 
 # ==============================================================================
 # 1. CẤU HÌNH (CONFIGURATION)
@@ -36,18 +58,12 @@ if sys.stdout.encoding != 'utf-8':
 # ==============================================================================
 # Directory of dataset
 TRAIN_DIR = os.path.join(BASE_DATA, "seg_train", "seg_train")
-TEST_DIR  = os.path.join(BASE_DATA, "seg_test", "seg_test")
+VAL_DIR   = os.path.join(BASE_DATA, "seg_test", "seg_test")
 PRED_DIR  = os.path.join(BASE_DATA, "seg_pred", "seg_pred")
 
 # Lưu checkpoint và file nộp bài vào OUTPUT_DIR
 MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
 SUBMISSION_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
-
-BATCH_SIZE = 32          # Trên máy local CPU để 16; khi lên Kaggle/Colab GPU để 32 hoặc 64
-EPOCHS = 15               # Chạy thử 2 epoch trên local; khi train thật để 10-15
-LEARNING_RATE = 1e-4     # Chuẩn cho fine-tuning pretrained model
-NUM_CLASSES = 6
-IMAGE_SIZE = (224, 224)
 
 # Tự động chọn GPU nếu có, ngược lại dùng CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,7 +91,7 @@ train_transforms = transforms.Compose([
     transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD)
 ])
 
-test_transforms = transforms.Compose([
+val_transforms = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD)
@@ -86,13 +102,14 @@ test_transforms = transforms.Compose([
 # ==============================================================================
 print(">> Đang tải dữ liệu...")
 train_dataset = datasets.ImageFolder(root=TRAIN_DIR, transform=train_transforms)
-test_dataset = datasets.ImageFolder(root=TEST_DIR, transform=test_transforms)
+val_dataset   = datasets.ImageFolder(root=VAL_DIR, transform=val_transforms)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+num_workers = 2 if torch.cuda.is_available() else 0
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers)
+val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers)
 
 print(f"-> Số ảnh Train: {len(train_dataset)} ({len(train_loader)} batches)")
-print(f"-> Số ảnh Test:   {len(test_dataset)} ({len(test_dataset)} batches)")
+print(f"-> Số ảnh Val:   {len(val_dataset)} ({len(val_loader)} batches)")
 print(f"-> Danh sách nhãn: {train_dataset.classes}")
 
 # ==============================================================================
@@ -146,7 +163,9 @@ for epoch in range(EPOCHS):
     model.train()
     train_loss, train_correct, total_train = 0.0, 0, 0
     
-    for images, labels in train_loader:
+    # Bọc train_loader vào tqdm để hiện thanh tiến trình động
+    train_pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] TRAIN", leave=False)
+    for images, labels in train_pbar:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
         
         optimizer.zero_grad()           # Xóa gradient cũ
@@ -167,8 +186,9 @@ for epoch in range(EPOCHS):
     model.eval()
     val_loss, val_correct, total_val = 0.0, 0, 0
     
+    val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] VAL  ", leave=False)
     with torch.no_grad():               # Tắt tính gradient để tiết kiệm RAM/tăng tốc
-        for images, labels in test_loader:
+        for images, labels in val_pbar:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             
             outputs = model(images)
@@ -214,7 +234,7 @@ if os.path.exists(PRED_DIR) and len(os.listdir(PRED_DIR)) > 0:
         for img_name in pred_images:
             img_path = os.path.join(PRED_DIR, img_name)
             img = Image.open(img_path).convert("RGB")
-            tensor = test_transforms(img).unsqueeze(0).to(DEVICE)
+            tensor = val_transforms(img).unsqueeze(0).to(DEVICE)
             
             output = model(tensor)
             _, predicted_idx = torch.max(output, 1)
